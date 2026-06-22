@@ -1,0 +1,1493 @@
+from flask import Flask, request, redirect, session
+from datetime import datetime, timedelta, date
+import sqlite3
+import os
+
+app = Flask(__name__)
+app.secret_key = "docmed_secret_key_123"
+
+print("PASTA ATUAL:", os.getcwd())
+
+def init_db():
+    conn = sqlite3.connect("docmed.db")
+    c = conn.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS solicitacoes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+        nome TEXT,
+        prontuario TEXT,
+        atendimento TEXT,
+
+        telefone TEXT,
+        email TEXT,
+
+        tipo_atendimento TEXT,
+        tipo_envio TEXT,
+
+        tipo_copia TEXT,
+        tipo_solicitacao TEXT,
+
+        data_atendimento TEXT,
+        data_alta TEXT,
+
+        folhas INTEGER,
+        valor REAL,
+
+        data_solicitacao TEXT,
+        data_entrega TEXT,
+        data_pronto TEXT,
+        data_entregue TEXT,
+
+        status TEXT,
+        observacoes TEXT
+    )
+    """)
+
+    c.execute("""
+CREATE TABLE IF NOT EXISTS usuarios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT,
+    usuario TEXT UNIQUE,
+    senha TEXT,
+    perfil TEXT
+)
+""")
+    
+    c.execute("""
+CREATE TABLE IF NOT EXISTS historico (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    solicitacao_id INTEGER,
+
+    data TEXT,
+    usuario TEXT,
+    acao TEXT,
+
+    detalhes TEXT
+)
+""")
+    
+    c.execute("""
+INSERT OR IGNORE INTO usuarios
+(nome, usuario, senha, perfil)
+VALUES
+('Administrador', 'admin', '1234', 'Administrador')
+""")
+
+    conn.commit()
+    conn.close()
+
+DIAS_PRAZO = 15
+
+FERIADOS = [
+    "01-01",
+    "21-04",
+    "01-05",
+    "07-09",
+    "12-10",
+    "02-11",
+    "15-11",
+    "20-11",
+    "25-12"
+]
+
+def eh_dia_util(data):
+    if data.weekday() >= 5:
+        return False
+
+    if data.strftime("%d-%m") in FERIADOS:
+        return False
+
+    return True
+
+
+def adicionar_dias_uteis(data_inicio, dias):
+    data = data_inicio
+    adicionados = 0
+
+    while adicionados < dias:
+        data += timedelta(days=1)
+
+        if eh_dia_util(data):
+            adicionados += 1
+
+    return data
+
+def cor_prazo(data_entrega):
+    if not data_entrega:
+        return "secondary"
+
+    try:
+        entrega = datetime.strptime(str(data_entrega), "%Y-%m-%d").date()
+    except:
+        return "secondary"
+
+    hoje = date.today()
+    diff = (entrega - hoje).days
+
+    if diff < 0:
+        return "danger"   # vermelho (atrasado)
+    elif diff == 0:
+        return "warning"  # laranja (hoje)
+    else:
+        return "success"  # verde (ok)
+def formatar_data(data):
+    if not data:
+        return ""
+
+    try:
+        return datetime.strptime(str(data), "%Y-%m-%d").strftime("%d/%m/%Y")
+    except:
+        return data   
+    
+def mes_da_solicitacao(data_str):
+    try:
+        data = datetime.strptime(data_str, "%Y-%m-%d")
+        return data.strftime("%Y-%m")
+    except:
+        return "Sem data"   
+    
+def listar_solicitacoes():
+    conn = sqlite3.connect("docmed.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM solicitacoes ORDER BY id DESC")
+    dados = c.fetchall()
+
+    conn.close()
+    return dados
+
+def cor_status(status):
+    if status == "⏳ Pendente":
+        return "warning"   # amarelo
+    elif status == "✅ Autorizado":
+        return "success"   # verde
+    elif status == "📦 Entregue":
+        return "primary"   # azul
+    elif status == "❌ Cancelado":
+        return "danger"    # vermelho
+    else:
+        return "secondary"
+    
+def salvar_historico(solicitacao_id, acao, usuario="Sistema"):
+    conn = sqlite3.connect("docmed.db")
+    c = conn.cursor()
+
+    c.execute("""
+        INSERT INTO historico (solicitacao_id, data, usuario, acao)
+        VALUES (?, ?, ?, ?)
+    """, (
+        solicitacao_id,
+        datetime.now().strftime("%d/%m/%Y %H:%M"),
+        usuario,
+        acao
+    ))
+
+    conn.commit()
+    conn.close()
+
+def verificar_login(usuario, senha):
+
+    conn = sqlite3.connect("docmed.db")
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT * FROM usuarios
+        WHERE usuario = ? AND senha = ?
+    """, (usuario, senha))
+
+    user = c.fetchone()
+
+    conn.close()
+
+    return user
+
+@app.route("/")
+def inicio():
+
+    if "usuario" not in session:
+        return redirect("/login")
+
+    conn = sqlite3.connect("docmed.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM solicitacoes ORDER BY id DESC")
+    solicitacoes = c.fetchall()
+
+    conn.close()
+
+    total = len(solicitacoes)
+
+    fisicos = 0
+    digitais = 0
+    valor_total = 0
+
+    pendentes = 0
+    atrasados = 0
+    vencendo = 0
+    cancelados = 0
+
+    por_mes = {}
+
+    hoje = date.today()
+
+    for s in solicitacoes:
+
+        if s["status"] == "⏳ Pendente":
+            pendentes += 1
+        elif s["status"] == "❌ Cancelado":
+            cancelados += 1
+
+        # 🔥 AQUI ESTÁ A CORREÇÃO: Só calcula atraso se NÃO estiver cancelado nem entregue
+        if s["status"] not in ["❌ Cancelado", "📦 Entregue"]:
+            try:
+                if s["data_entrega"]:
+                    entrega = datetime.strptime(s["data_entrega"], "%Y-%m-%d").date()
+                    diff = (entrega - hoje).days
+
+                    if diff < 0:
+                        atrasados += 1
+                    elif diff <= 2:
+                        vencendo += 1
+            except:
+                pass
+
+        # ================= FÍSICO / DIGITAL =================
+        if s["tipo_envio"] == "Físico":
+            fisicos += 1
+            valor_total += float(s["valor"] or 0)
+        else:
+            digitais += 1
+
+        # ================= POR MÊS =================
+        try:
+            mes = datetime.strptime(s["data_solicitacao"], "%Y-%m-%d").strftime("%Y-%m")
+            por_mes[mes] = por_mes.get(mes, 0) + 1
+        except:
+            pass
+
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<title>DocMed V2</title>
+
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {{
+    background: #f4f7fb;
+    color: #1f2a37;
+    font-family: Arial, sans-serif;
+}}
+
+.card {{
+    background: #ffffff;
+    color: #1f2a37;
+    border-radius: 14px;
+    border: 1px solid #e5e7eb;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+}}
+
+h1, h2, h3, h4, h5 {{
+    font-weight: 600;
+}}
+
+.text-primary {{
+    color: #2563eb !important;
+}}
+
+.btn-primary {{
+    background: #2563eb;
+    border: none;
+}}
+
+.btn-primary:hover {{
+    background: #1d4ed8;
+}}
+
+.btn-warning {{
+    background: #a78bfa;
+    border: none;
+    color: white;
+}}
+
+.btn-danger {{
+    background: #ef4444;
+    border: none;
+    color: white;
+}}
+
+.btn-success {{
+    background: #22c55e;
+    border: none;
+    color: white;
+}}
+
+input, textarea, select {{
+    background: #ffffff !important;
+    color: #1f2a37 !important;
+    border: 1px solid #d1d5db !important;
+    border-radius: 8px;
+}}
+</style>
+
+</head>
+
+<body class="bg-light">
+
+<div class="container mt-4">
+
+<div class="d-flex justify-content-between align-items-center">
+
+    <div class="d-flex align-items-center">
+
+        <div style="font-size:24px; font-weight:bold; color:black;">
+    🏥 DocMed
+    </div>
+
+        <div>
+            <h1 class="mb-0" style="color:black;">DocMed</h1>
+            <h5 class="text-secondary">Sistema de Controle de Solicitações de Prontuários</h5>
+        </div>
+
+    </div>
+
+    <div class="text-end">
+
+        <div class="mb-2">
+            👤 {session.get("usuario")}
+        </div>
+
+        <a href="/logout" class="btn btn-danger">🚪 Sair</a>
+
+        {"<br><br><a href='/novo_usuario' class='btn btn-success'>👤 Criar Novo Usuário</a>"
+        if session.get("perfil") == "Administrador" else ""}
+
+    </div>
+
+</div>
+
+<br>
+
+<div class="row mb-4">
+
+<div class="col-md-3">
+<div class="card text-center p-3">
+<h5>Pendentes</h5>
+<h3>{pendentes}</h3>
+</div>
+</div>
+
+<div class="col-md-3">
+<div class="card text-center p-3">
+<h5>Vencendo</h5>
+<h3>{vencendo}</h3>
+</div>
+</div>
+
+<div class="col-md-3">
+<div class="card text-center p-3">
+<h5>Atrasados</h5>
+<h3>{atrasados}</h3>
+</div>
+</div>
+
+<div class="col-md-3">
+<div class="card text-center p-3">
+<h5>Total</h5>
+<h3>{total}</h3>
+</div>
+</div>
+
+</div>
+
+<div class="card p-3 mb-3">
+<h4>📊 Dashboard</h4>
+
+<div class="row">
+
+    <!-- 📦 ENVIO -->
+    <div class="col-md-4 mb-3">
+        <div class="card p-3 h-100">
+            <h6>📦 Tipo de Envio</h6>
+            <div style="height:180px;">
+                <canvas id="graficoEnvio"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- 📅 MÊS -->
+    <div class="col-md-4 mb-3">
+        <div class="card p-3 h-100">
+            <h6>📅 Por Mês</h6>
+            <div style="height:180px;">
+                <canvas id="graficoMes"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- 📊 STATUS -->
+    <div class="col-md-4 mb-3">
+        <div class="card p-3 h-100">
+            <h6>📊 Status</h6>
+            <div style="height:180px;">
+                <canvas id="graficoStatus"></canvas>
+            </div>
+        </div>
+    </div>
+
+</div>
+</div>
+<div class="card shadow p-4 mb-4">
+
+<h2 class="mb-3">➕ Nova Solicitação</h2>
+
+<form action="/salvar" method="post">
+
+<!-- ================= 1 LINHA ================= -->
+<div class="row">
+
+    <div class="col-md-2 mb-3">
+        <label>Prontuário</label>
+        <input type="text" name="prontuario" class="form-control" required>
+    </div>
+
+    <div class="col-md-2 mb-3">
+        <label>Atendimento</label>
+        <input type="text" name="atendimento" class="form-control" required>
+    </div>
+
+    <div class="col-md-4 mb-3">
+        <label>Nome do Paciente</label>
+        <input type="text" name="nome" class="form-control" required>
+    </div>
+
+    <div class="col-md-4 mb-3">
+        <label>Tipo de Atendimento</label><br>
+
+        <input type="radio" name="tipo_atendimento" value="Emergência" required> 🚨 Emergência
+        <input type="radio" name="tipo_atendimento" value="Internação"> 🛏️ Internação
+
+    </div>
+
+</div>
+
+<!-- ================= 2 LINHA ================= -->
+<div class="row">
+
+    <div class="col-md-3 mb-3">
+        <label>Email</label>
+        <input type="email" name="email" class="form-control">
+    </div>
+
+    <div class="col-md-3 mb-3">
+        <label>Telefone</label>
+        <input type="text" name="telefone" class="form-control">
+    </div>
+
+    <div class="col-md-3 mb-3">
+        <label>Tipo de Solicitação</label><br>
+
+        <input type="radio" name="tipo_solicitacao" value="SUS" required> SUS
+        <input type="radio" name="tipo_solicitacao" value="Particular"> Particular
+        <input type="radio" name="tipo_solicitacao" value="Jurídico"> Jurídico
+
+    </div>
+
+    <div class="col-md-3 mb-3">
+        <label>Tipo de Cópia</label><br>
+
+        <input type="radio" name="tipo_copia" value="Integral" required> Integral
+        <input type="radio" name="tipo_copia" value="Parcial"> Parcial
+
+    </div>
+
+</div>
+
+<div class="row">
+
+    <div class="col-md-3 mb-3">
+        <label>Data da Solicitação</label>
+        <input type="date" name="data_solicitacao" class="form-control">
+    </div>
+
+</div>
+
+<!-- ================= 3 LINHA ================= -->
+<div class="row">
+
+    <div class="col-md-3 mb-3">
+        <label>Tipo de Envio</label><br>
+
+        <input type="radio" id="fisicoRadio" name="tipo_envio" value="Físico" required onchange="toggleFolhas()"> Físico
+        <input type="radio" id="digitalRadio" name="tipo_envio" value="Digital" onchange="toggleFolhas()"> Digital
+
+    </div>
+
+    <div class="col-md-2 mb-3" id="campoFolhas">
+        <label>Nº de Folhas</label>
+        <input type="number" name="folhas" class="form-control">
+    </div>
+
+    <div class="col-md-3 mb-3">
+        <label>Data Atendimento</label>
+        <input type="date" name="data_atendimento" class="form-control">
+    </div>
+
+    <div class="col-md-4 mb-3">
+        <label>Data Alta</label>
+        <input type="date" name="data_alta" class="form-control">
+    </div>
+
+</div>
+
+<!-- ================= 4 LINHA ================= -->
+<div class="row">
+
+    <div class="col-md-6 mb-3">
+        <label>Observações</label>
+        <textarea name="observacoes" rows="3" class="form-control"></textarea>
+    </div>
+
+    <div class="col-md-6 mb-3">
+        <label>Solicitado por</label><br>
+
+        <input type="radio" name="solicitado_por" value="Paciente" required> Paciente
+        <input type="radio" name="solicitado_por" value="Familiar/Responsável"> Familiar/Responsável
+        <input type="radio" name="solicitado_por" value="Procurador"> Procurador
+        <input type="radio" name="solicitado_por" value="Familiar (Paciente falecido)"> Familiar (Paciente falecido)
+
+    </div>
+
+</div>
+
+<button class="btn btn-primary">💾 Salvar Solicitação</button>
+
+</form>
+</div>
+
+<h2 class="mb-3">Solicitações</h2>
+"""
+
+    for s in solicitacoes:
+
+        html += f"""
+        <div class="card shadow mb-3">
+            <div class="card-body">
+
+                <h5 class="text-primary">{s['nome']}</h5>
+
+                <p><b>Prontuário:</b> {s['prontuario']}</p>
+                <p><b>Atendimento:</b> {s['atendimento']}</p>
+
+                <p><b>Status:</b> {s['status']}</p>
+
+                <a href="/detalhes/{s['id']}" class="btn btn-outline-primary">🔍 Detalhes</a>
+                <a href="/editar/{s['id']}" class="btn btn-outline-warning">✏️ Editar</a>
+                <a href="/historico/{s['id']}" class="btn btn-outline-info">📜 Histórico</a>
+                <a href="/excluir/{s['id']}" class="btn btn-outline-danger">🗑️ Excluir</a>
+
+            </div>
+        </div>
+        """
+
+    html += """
+</div>
+
+<script>
+const ctx = document.getElementById('graficoStatus');
+
+new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+        labels: ["Pendentes", "Vencendo", "Atrasados", "Cancelados"],
+        datasets: [{
+            data: [
+                """ + str(pendentes) + """,
+                """ + str(vencendo) + """,
+                """ + str(atrasados) + """,
+                """ + str(cancelados) + """
+            ],
+            backgroundColor: ['#f59e0b','#f97316','#ef4444','#6b7280']
+        }]
+    }
+});
+</script>
+
+<script>
+const ctxEnvio = document.getElementById('graficoEnvio');
+
+new Chart(ctxEnvio, {
+    type: 'pie',
+    data: {
+        labels: ["Físico", "Digital"],
+        datasets: [{
+            data: [
+                """ + str(fisicos) + """,
+                """ + str(digitais) + """
+            ],
+            backgroundColor: ['#2563eb', '#22c55e']
+        }]
+    }
+});
+</script>
+
+<script>
+const ctxMes = document.getElementById('graficoMes');
+
+new Chart(ctxMes, {
+    type: 'bar',
+    data: {
+        labels: """ + str(list(por_mes.keys())) + """,
+        datasets: [{
+            label: 'Solicitações',
+            data: """ + str(list(por_mes.values())) + """,
+            backgroundColor: '#2563eb'
+        }]
+    }
+});
+</script>
+<script>
+function toggleFolhas() {
+    const fisico = document.getElementById("fisicoRadio");
+    const digital = document.getElementById("digitalRadio");
+    const campo = document.getElementById("campoFolhas");
+
+    if (digital.checked) {
+        campo.style.display = "none";
+    } else {
+        campo.style.display = "block";
+    }
+}
+
+// garante que funciona ao abrir a página
+window.onload = function () {
+    toggleFolhas();
+};
+</script>
+
+</body>
+</html>
+"""
+
+    return html
+
+def mes_da_solicitacao(data_str):
+
+    meses = [
+        "Janeiro", "Fevereiro", "Março", "Abril",
+        "Maio", "Junho", "Julho", "Agosto",
+        "Setembro", "Outubro", "Novembro", "Dezembro"
+    ]
+
+    data = datetime.strptime(data_str, "%Y-%m-%d")
+
+    return f"{meses[data.month - 1]} {data.year}"
+
+@app.route("/salvar", methods=["POST"])
+def salvar():
+
+    tipo = request.form.get("tipo_envio")
+    folhas = request.form.get("folhas")
+
+    # Se for digital, ignora folhas
+    if tipo == "Digital":
+        folhas = 0
+        valor = 0
+    else:
+        if not folhas:
+            folhas = 0
+        valor = float(folhas) * 0.25
+
+    # Prazo de entrega
+    data_solicitacao = request.form.get("data_solicitacao")
+
+    if data_solicitacao:
+        data_base = datetime.strptime(data_solicitacao, "%Y-%m-%d")
+    else:
+        data_base = datetime.now()
+
+    data_entrega = adicionar_dias_uteis(data_base, DIAS_PRAZO)
+
+    solicitacao = {
+    "tipo_atendimento": request.form.get("tipo_atendimento"),
+    "tipo_copia": request.form.get("tipo_copia"),
+
+    "tipo_solicitacao": request.form.get("tipo_solicitacao"),
+    "tipo_envio": request.form.get("tipo_envio"),
+
+    "prontuario": request.form.get("prontuario"),
+    "atendimento": request.form.get("atendimento"),
+
+    "nome": request.form.get("nome"),
+    "telefone": request.form.get("telefone"),
+    "email": request.form.get("email"),
+
+    "folhas": folhas,
+    "valor": valor,
+
+    "data_atendimento": request.form.get("data_atendimento"),
+    "data_alta": request.form.get("data_alta"),
+
+    "data_solicitacao": data_solicitacao,
+    "data_base": data_base.strftime("%Y-%m-%d"),
+    "data_entrega": data_entrega.strftime("%Y-%m-%d"),
+    "data_pronto": "",
+    "data_entregue": "",
+
+    # Controle da entrega
+    "data_entrega_real": "",
+    "data_entrega_registrada": "",
+
+    # Controle da autorização
+    "status": "⏳ Pendente",
+    "data_autorizacao": "",
+    "autorizado_por": "",
+    "motivo_cancelamento": "",
+
+    # Auditoria antiga
+    "cadastrado_por": "Usuário do Sistema",
+
+    # Observações
+    "observacoes": request.form.get("observacoes", ""),
+
+    # ===== AUDITORIA COMPLETA =====
+    "criado_por": "Usuário do Sistema",
+    "data_criacao": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+
+    "editado_por": "",
+    "data_edicao": "",
+
+    "pronto_por": "",
+    "data_pronto": "",
+
+    "entregue_por": "",
+    "data_entregue": "",
+
+    "excluido": False,
+    "excluido_por": "",
+    "data_exclusao": "",
+    "motivo_exclusao": ""
+}
+
+    conn = sqlite3.connect("docmed.db")
+    c = conn.cursor()
+
+    c.execute("""
+INSERT INTO solicitacoes (
+    nome,
+    prontuario,
+    atendimento,
+    telefone,
+    email,
+    tipo_atendimento,
+    tipo_envio,
+    tipo_copia,
+    tipo_solicitacao,
+    data_atendimento,
+    data_alta,
+    folhas,
+    valor,
+    data_solicitacao,
+    data_entrega,
+    data_pronto,
+    data_entregue,
+    status,
+    observacoes
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""", (
+    solicitacao["nome"],
+    solicitacao["prontuario"],
+    solicitacao["atendimento"],
+    solicitacao["telefone"],
+    solicitacao["email"],
+    solicitacao["tipo_atendimento"],
+    solicitacao["tipo_envio"],
+    solicitacao["tipo_copia"],
+    solicitacao["tipo_solicitacao"],
+    solicitacao["data_atendimento"],
+    solicitacao["data_alta"],
+    solicitacao["folhas"],
+    solicitacao["valor"],
+    solicitacao["data_solicitacao"],
+    solicitacao["data_entrega"],   # prazo
+    solicitacao["data_pronto"],
+    solicitacao["data_entregue"],
+    solicitacao["status"],
+    solicitacao["observacoes"]
+))
+
+    conn.commit()
+
+    salvar_historico(
+        solicitacao_id=c.lastrowid,
+        acao="📌 Solicitação cadastrada",
+        usuario=session.get("usuario", "Sistema")
+    )
+
+    conn.close()
+
+    
+    return f"""
+    <h2>✅ Solicitação salva com sucesso!</h2>
+
+    <p>📅 Prazo de entrega: <b>{data_entrega.strftime("%d/%m/%Y")}</b></p>
+
+    <a href="/">Voltar para o DocMed</a>
+    """
+
+@app.route("/detalhes/<int:id>")
+def detalhes(id):
+
+    conn = sqlite3.connect("docmed.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM solicitacoes WHERE id = ?", (id,))
+    s = c.fetchone()
+
+    conn.close()
+
+    if not s:
+        return "<h1>❌ Solicitação não encontrada</h1>"
+
+    return f"""
+    <html>
+    <head>
+        <title>Detalhes</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    </head>
+
+    <body class="bg-light">
+
+    <div class="container mt-4">
+
+        <div class="card shadow p-4">
+
+       <p><b>Nome:</b> {s["nome"]}</p>
+<p><b>Email:</b> {s["email"]}</p>
+<p><b>Telefone:</b> {s["telefone"]}</p>
+<p><b>Prontuário:</b> {s["prontuario"]}</p>
+
+<p><b>Atendimento:</b> {s["atendimento"]}</p>
+<p><b>Tipo de Atendimento:</b> {s["tipo_atendimento"]}</p>
+<p><b>Data do Atendimento:</b> {formatar_data(s["data_atendimento"])}</p>
+<p><b>Data da Alta:</b> {formatar_data(s["data_alta"])}</p>
+
+<p><b>Data da Solicitação:</b> {formatar_data(s["data_solicitacao"])}</p>
+
+<p><b>Tipo de Solicitação:</b> {s["tipo_solicitacao"]}</p>
+<p><b>Tipo de Envio:</b> {s["tipo_envio"]}</p>
+<p><b>Tipo de Cópia:</b> {s["tipo_copia"]}</p>
+
+<p><b>Nº de Folhas:</b> {s["folhas"]}</p>
+<p><b>Valor:</b> R$ {float(s["valor"] or 0):.2f}</p>
+
+<p><b>Prazo para Entrega:</b> {formatar_data(s["data_entrega"])}</p>
+
+<p><b>Observações:</b> {s["observacoes"] or ""}</p>
+
+<p>
+<b>Status:</b> {s["status"]}
+</p>
+
+<a href="/" class="btn btn-secondary">⬅ Voltar</a>    
+
+        </div>
+
+    </div>
+
+
+    </body>
+    </html>
+    """
+
+@app.route("/excluir/<int:id>", methods=["GET", "POST"])
+def excluir(id):
+
+    if session.get("perfil") != "Administrador":
+        return """
+        <h2>❌ Apenas administradores podem excluir solicitações</h2>
+        <a href="/">Voltar</a>
+        """
+
+    if request.method == "POST":
+
+        justificativa = request.form.get("justificativa")
+
+        if not justificativa.strip():
+            return """
+            <h2>❌ Informe uma justificativa</h2>
+            <a href="/">Voltar</a>
+            """
+
+        conn = sqlite3.connect("docmed.db")
+        c = conn.cursor()
+
+        c.execute(
+            "DELETE FROM solicitacoes WHERE id = ?",
+            (id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+        return redirect("/")
+
+    return """
+    <div class="container mt-4">
+        <div class="card shadow p-4">
+
+            <h2>🔒 Exclusão Restrita</h2>
+
+            <p>Informe a justificativa para exclusão da solicitação.</p>
+
+            <form method="POST">
+
+                
+                <label>Justificativa</label>
+                <textarea
+                    name="justificativa"
+                    class="form-control"
+                    rows="4"
+                    required></textarea>
+
+                <br>
+
+                <button class="btn btn-danger">
+                    🗑️ Confirmar Exclusão
+                </button>
+
+                <a href="/" class="btn btn-secondary">
+                    Cancelar
+                </a>
+
+            </form>
+
+        </div>
+    </div>
+    """
+
+@app.route("/editar/<int:id>", methods=["GET", "POST"])
+def editar(id):
+
+    conn = sqlite3.connect("docmed.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("SELECT * FROM solicitacoes WHERE id = ?", (id,))
+    s = c.fetchone()
+
+    
+    if not s:
+        conn.close()
+        return "Solicitação não encontrada"
+
+        # ===== SALVAR ALTERAÇÕES =====
+    if request.method == "POST":
+
+        c.execute("""
+        UPDATE solicitacoes
+        SET status = ?,
+            observacoes = ?,
+            data_pronto = ?,
+            data_entregue = ?
+        WHERE id = ?
+        """, (
+            request.form.get("status"),
+            request.form.get("observacoes", ""),
+            request.form.get("data_pronto", ""),
+            request.form.get("data_entregue", ""),
+            id
+        ))
+
+        conn.commit()
+
+        status = request.form.get("status")
+
+        if status == "📦 Entregue":
+
+            salvar_historico(
+            solicitacao_id=id,
+            acao="📦 Prontuário entregue ao paciente",
+            usuario=session.get("usuario", "Sistema")
+        )
+
+        elif status == "✅ Autorizado":
+
+            salvar_historico(
+                solicitacao_id=id,
+                acao="✅ Solicitação autorizada",
+                usuario=session.get("usuario", "Sistema")
+        )
+
+        else:
+
+            salvar_historico(
+            solicitacao_id=id,
+            acao="✏️ Solicitação editada",
+            usuario=session.get("usuario", "Sistema")
+        )
+
+        conn.close()
+
+        return redirect("/")
+
+    conn.close()
+
+       
+    return f"""
+    
+<div class="container mt-4">
+    <div class="card shadow p-4">
+
+        <h2>✏️ Editar Solicitação</h2>
+
+<form method="POST">
+
+    <label>Status</label>
+    <select name="status" class="form-control" id="status" onchange="toggleMotivo()">
+
+        <option value="⏳ Pendente" {"selected" if s['status'] == '⏳ Pendente' else ''}>
+            Pendente
+        </option>
+
+        <option value="✅ Autorizado" {"selected" if s['status'] == '✅ Autorizado' else ''}>
+            Autorizado
+        </option>
+
+        <option value="❌ Cancelado" {"selected" if s['status'] == '❌ Cancelado' else ''}>
+            Cancelado
+        </option>
+
+        <option value="📦 Entregue" {"selected" if s['status'] == '📦 Entregue' else ''}>
+            Entregue
+        </option>
+
+    </select>
+
+    <br>
+
+    <div id="motivoBox" style="display:none;">
+        <label>Motivo do Cancelamento</label>
+        <input
+            type="text"
+            name="motivo_cancelamento"
+            class="form-control"
+            value="">
+    </div>
+
+    <br>
+
+    <label>Data Pronto</label>
+<input
+    type="date"
+    name="data_pronto"
+    class="form-control"
+    value="{s['data_pronto'] if s['data_pronto'] else ''}">
+
+<br>
+
+<label>Data Entregue</label>
+<input
+    type="date"
+    name="data_entregue"
+    class="form-control"
+    value="{s['data_entregue'] if s['data_entregue'] else ''}">
+
+    <label>Motivo do Atraso</label>
+    <input
+        type="text"
+        name="motivo_atraso"
+        class="form-control"
+        value=""
+        placeholder="Preencher apenas se houve atraso">
+
+    <br>
+
+    <label>Observações</label>
+    <textarea
+        name="observacoes"
+        class="form-control">{s['observacoes'] if s['observacoes'] else ''}</textarea>
+
+    <br>
+
+    <button class="btn btn-success">💾 Salvar</button>
+    <a href="/" class="btn btn-secondary">Voltar</a>
+
+</form>
+
+</div>
+</div>
+
+<script>
+function toggleMotivo() {{
+    var status = document.getElementById("status").value;
+    var box = document.getElementById("motivoBox");
+
+    box.style.display = (status == "❌ Cancelado") ? "block" : "none";
+}}
+
+toggleMotivo();
+</script>
+"""
+
+@app.route("/marcar_pronto/<int:id>")
+def marcar_pronto(id):
+    hoje = date.today().strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect("docmed.db")
+    c = conn.cursor()
+
+    c.execute("""
+    UPDATE solicitacoes
+    SET data_pronto = ?, status = ?
+    WHERE id = ?
+    """, (hoje, "📄 Pronto para retirada", id))
+
+    conn.commit()
+    conn.close()
+
+    return redirect("/")
+
+@app.route("/marcar_entregue/<int:id>")
+def marcar_entregue(id):
+    hoje = date.today().strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect("docmed.db")
+    c = conn.cursor()
+
+    c.execute("""
+    UPDATE solicitacoes
+    SET data_entregue = ?, status = ?
+    WHERE id = ?
+    """, (hoje, "📦 Entregue", id))
+
+    conn.commit()
+    conn.close()
+
+    return redirect("/")
+
+@app.route("/historico/<int:id>")
+def historico(id):
+
+    conn = sqlite3.connect("docmed.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute("""
+        SELECT * FROM historico
+        WHERE solicitacao_id = ?
+        ORDER BY id DESC
+    """, (id,))
+
+    logs = c.fetchall()
+    conn.close()
+
+    html = """
+    <div class="container mt-4">
+        <div class="card shadow p-4">
+
+        <h2>📜 Linha do Tempo da Solicitação</h2>
+        <hr>
+        <div class="timeline">
+    """
+
+    for h in logs:
+        html += f"""
+        <div style="
+            border-left: 3px solid #0d6efd;
+            margin-left: 10px;
+            padding-left: 15px;
+            margin-bottom: 15px;
+        ">
+            <div style="font-size:14px; color:gray;">
+                🕒 {h['data']}
+            </div>
+
+            <div style="font-weight:bold;">
+                👤 {h['usuario']}
+            </div>
+
+            <div>
+                📝 {h['acao']}
+            </div>
+        </div>
+        """
+
+    html += """
+        </div>
+
+        <a href="/" class="btn btn-secondary mt-3">Voltar</a>
+
+        </div>
+    </div>
+    """
+
+    return html
+
+@app.route("/novo_usuario", methods=["GET", "POST"])
+def novo_usuario():
+
+    # 🔒 Só administrador pode acessar
+    if "usuario" not in session:
+        return redirect("/login")
+
+    if session.get("perfil") != "Administrador":
+        return """
+        <h2>⛔ Acesso Negado</h2>
+        <p>Apenas administradores podem criar usuários.</p>
+        <a href="/">Voltar</a>
+        """
+
+    if request.method == "POST":
+
+        nome = request.form.get("nome")
+        usuario = request.form.get("usuario")
+        senha = request.form.get("senha")
+        perfil = request.form.get("perfil")
+
+        conn = sqlite3.connect("docmed.db")
+        c = conn.cursor()
+
+        try:
+
+            c.execute("""
+            INSERT INTO usuarios
+            (nome, usuario, senha, perfil)
+            VALUES (?, ?, ?, ?)
+            """, (
+                nome,
+                usuario,
+                senha,
+                perfil
+            ))
+
+            conn.commit()
+
+        except:
+
+            conn.close()
+
+            return """
+            <h2>❌ Usuário já existe</h2>
+            <a href='/novo_usuario'>Voltar</a>
+            """
+
+        conn.close()
+
+        return redirect("/")
+
+    return """
+    <div class="container mt-4">
+
+        <div class="card shadow p-4">
+
+            <h2>👤 Novo Usuário</h2>
+
+            <form method="POST">
+
+                <label>Nome</label>
+                <input
+                    type="text"
+                    name="nome"
+                    class="form-control"
+                    required>
+
+                <br>
+
+                <label>Usuário</label>
+                <input
+                    type="text"
+                    name="usuario"
+                    class="form-control"
+                    required>
+
+                <br>
+
+                <label>Senha</label>
+                <input
+                    type="password"
+                    name="senha"
+                    class="form-control"
+                    required>
+
+                <br>
+
+                <label>Perfil</label>
+
+                <select
+                    name="perfil"
+                    class="form-control">
+
+                    <option>Administrador</option>
+                    <option>Atendente</option>
+
+                </select>
+
+                <br>
+
+                <button class="btn btn-success">
+                    💾 Salvar Usuário
+                </button>
+
+                <a href="/" class="btn btn-secondary">
+                    Voltar
+                </a>
+
+            </form>
+
+        </div>
+
+    </div>
+    """
+@app.route("/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "POST":
+        usuario = request.form.get("usuario")
+        senha = request.form.get("senha")
+
+        user = verificar_login(usuario, senha)
+
+        if user:
+            session["usuario"] = user[1]   # nome
+            session["perfil"] = user[4]    # perfil
+            return redirect("/")
+        else:
+            return "<h3>❌ Login inválido</h3><a href='/login'>Voltar</a>"
+
+    return """
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<title>Login DocMed</title>
+
+<style>
+body {
+    margin: 0;
+    height: 100vh;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    background: linear-gradient(135deg, #2563eb, #1e293b);
+}
+
+/* escurece o fundo */
+.overlay {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.5);
+}
+
+/* animação */
+@keyframes fadeUp {
+    from {
+        opacity: 0;
+        transform: translateY(25px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.login-box {
+    position: relative;
+    z-index: 2;
+    width: 320px;
+    padding: 25px;
+
+    background: rgba(255,255,255,0.15);
+    backdrop-filter: blur(10px);
+    border-radius: 12px;
+    text-align: center;
+
+    animation: fadeUp 0.8s ease-out;
+}
+
+h2 {
+    color: white;
+    margin-bottom: 20px;
+}
+
+input {
+    width: 100%;
+    padding: 12px;
+    margin: 8px 0;
+    border: none;
+    border-radius: 6px;
+    box-sizing: border-box; /* 🔥 garante alinhamento perfeito */
+}
+
+button {
+    width: 100%;
+    padding: 12px;
+    margin-top: 10px; /* 🔥 iguala espaçamento com inputs */
+    border: none;
+    border-radius: 6px;
+    background: #2563eb;
+    color: white;
+    cursor: pointer;
+    box-sizing: border-box; /* 🔥 mantém mesma largura dos inputs */
+    font-weight: bold;
+}
+
+button:hover {
+    background: #1d4ed8;
+}
+
+a {
+    display: block;
+    margin-top: 10px;
+    font-size: 13px;
+    color: white;
+    text-decoration: underline;
+}
+</style>
+</head>
+
+<body>
+
+<div class="overlay"></div>
+
+<div class="login-box">
+
+    <h2>Bem-vindo(a) ao DocMed</h2>
+
+    <form method="POST">
+        <input name="usuario" placeholder="Usuário" required>
+        <input name="senha" type="password" placeholder="Senha" required>
+
+        <button type="submit" id="loginBtn" onclick="mostrarLoading()">
+    <span id="btnText">🔐 Entrar</span>
+</button>
+    </form>
+
+    <a href="/esqueci-senha">Esqueci minha senha</a>
+
+</div>
+
+</body>
+</html>
+"""
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(debug=True)
