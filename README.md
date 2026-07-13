@@ -2,7 +2,7 @@
 
 Sistema web para gerenciamento de solicitações de prontuários médicos.
 
-## 📌 Sobre o projeto
+Sobre o projeto
 
 O DocMed é um sistema desenvolvido para otimizar o controle e acompanhamento de solicitações de prontuários médicos.
 
@@ -12,7 +12,7 @@ O objetivo é facilitar o gerenciamento das solicitações, permitindo acompanha
 
 ---
 
-## 🚀 Funcionalidades
+Funcionalidades
 
 ✅ Cadastro de solicitações de prontuários
 
@@ -34,7 +34,7 @@ O objetivo é facilitar o gerenciamento das solicitações, permitindo acompanha
 
 ---
 
-## 💻 Tecnologias utilizadas
+Tecnologias utilizadas
 
 ### Back-end
 - Python
@@ -52,8 +52,14 @@ O objetivo é facilitar o gerenciamento das solicitações, permitindo acompanha
 ---
 
 ## 📷 Demonstração
+<img width="1912" height="871" alt="tela de login" src="https://github.com/user-attachments/assets/f43ee949-0a6f-4c3e-8211-1b9c9a30d638" />
 
-*(Adicionar prints do sistema)*
+<img width="1895" height="870" alt="dashboard" src="https://github.com/user-attachments/assets/d2cbd220-0449-4c6a-8d03-3b89882999d6" />
+
+<img width="1913" height="862" alt="Captura de tela 2026-07-13 164933" src="https://github.com/user-attachments/assets/e960611e-2f9a-4c7b-abbb-d730a78ee42c" />
+
+
+
 
 Exemplo:
 
