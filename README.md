@@ -1,6 +1,6 @@
 # 🏥 DocMed
+Sistema web completo desenvolvido em Python e Flask para gerenciamento de solicitações de prontuários médicos.
 
-Sistema web para gerenciamento de solicitações de prontuários médicos.
 
 Sobre o projeto
 
